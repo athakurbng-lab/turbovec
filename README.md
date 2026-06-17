@@ -30,3 +30,14 @@ float[] normalSpaceVec = turbovec.convertToNormalSpace(qVec.getPackedCodes(), qV
 ```bash
 mvn test-compile exec:java -Dexec.classpathScope="test" -Dexec.mainClass="com.turbovec.RecallBenchmark"
 ```
+
+By default, the benchmark generates random 384-dimensional unit vectors. 
+If you want to use your own dataset, you can provide paths to space-separated `.txt` files containing your embeddings (where each line is a vector and each space-separated value is a dimension).
+
+Simply edit `src/test/java/com/turbovec/RecallBenchmark.java` and change the following variables at the top of the `main` method:
+
+```java
+String queryFile = "path/to/your/queries.txt"; // Link to query file
+String dataFile = "path/to/your/database.txt";  // Link to data file
+```
+If these variables are left empty (`""`), the benchmark will default back to generating random data.
