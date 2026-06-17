@@ -44,6 +44,13 @@ public class RecallBenchmark {
 
         int calibSize = Math.min(5000, numVectors);
 
+        int topK = 15;
+
+        System.out.println("Initializing TurboVec (dim=" + dim + ", bits=" + bits + ")...");
+        long start = System.currentTimeMillis();
+        TurboVec turbovec = new TurboVec(dim, bits);
+        System.out.println("Initialization took " + (System.currentTimeMillis() - start) + " ms");
+
         System.out.println("Fitting calibration on " + calibSize + " vectors...");
         float[][] calibBatch = new float[calibSize][dim];
         System.arraycopy(database, 0, calibBatch, 0, calibSize);
