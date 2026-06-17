@@ -11,25 +11,38 @@ public class RecallBenchmark {
         int bits = 4;
         int numVectors = 50000;
         int numQueries = 1000;
-        int topK = 15;
+        String queryFile = ""; // Link to query file (empty to generate random)
+        String dataFile = "";  // Link to data file (empty to generate random)
+
+        float[][] database;
+        if (dataFile != null && !dataFile.trim().isEmpty()) {
+            System.out.println("Loading data vectors from " + dataFile + "...");
+            database = loadVectors(dataFile, dim);
+            numVectors = database.length;
+        } else {
+            System.out.println("Generating " + numVectors + " random vectors...");
+            Random rand = new Random(42);
+            database = new float[numVectors][dim];
+            for (int i = 0; i < numVectors; i++) {
+                database[i] = randomUnitVector(dim, rand);
+            }
+        }
+
+        float[][] queries;
+        if (queryFile != null && !queryFile.trim().isEmpty()) {
+            System.out.println("Loading query vectors from " + queryFile + "...");
+            queries = loadVectors(queryFile, dim);
+            numQueries = queries.length;
+        } else {
+            System.out.println("Generating " + numQueries + " random queries...");
+            Random rand = new Random(43);
+            queries = new float[numQueries][dim];
+            for (int i = 0; i < numQueries; i++) {
+                queries[i] = randomUnitVector(dim, rand);
+            }
+        }
+
         int calibSize = Math.min(5000, numVectors);
-
-        System.out.println("Initializing TurboVec (dim=" + dim + ", bits=" + bits + ")...");
-        long start = System.currentTimeMillis();
-        TurboVec turbovec = new TurboVec(dim, bits);
-        System.out.println("Initialization took " + (System.currentTimeMillis() - start) + " ms");
-
-        System.out.println("Generating " + numVectors + " random vectors and " + numQueries + " queries...");
-        Random rand = new Random(42);
-        float[][] database = new float[numVectors][dim];
-        for (int i = 0; i < numVectors; i++) {
-            database[i] = randomUnitVector(dim, rand);
-        }
-
-        float[][] queries = new float[numQueries][dim];
-        for (int i = 0; i < numQueries; i++) {
-            queries[i] = randomUnitVector(dim, rand);
-        }
 
         System.out.println("Fitting calibration on " + calibSize + " vectors...");
         float[][] calibBatch = new float[calibSize][dim];
@@ -135,6 +148,22 @@ public class RecallBenchmark {
             v[i] /= norm;
         }
         return v;
+    }
+
+    private static float[][] loadVectors(String filePath, int expectedDim) {
+        try {
+            java.util.List<String> lines = java.nio.file.Files.readAllLines(java.nio.file.Paths.get(filePath));
+            float[][] vectors = new float[lines.size()][expectedDim];
+            for (int i = 0; i < lines.size(); i++) {
+                String[] parts = lines.get(i).trim().split("\\s+");
+                for (int j = 0; j < expectedDim; j++) {
+                    vectors[i][j] = Float.parseFloat(parts[j]);
+                }
+            }
+            return vectors;
+        } catch (Exception e) {
+            throw new RuntimeException("Error reading file: " + filePath, e);
+        }
     }
 
     private static float dotProduct(float[] a, float[] b) {
