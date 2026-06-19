@@ -1,7 +1,6 @@
 package com.turbovec;
 
 import org.apache.commons.math3.analysis.UnivariateFunction;
-import org.apache.commons.math3.analysis.integration.SimpsonIntegrator;
 import org.apache.commons.math3.distribution.BetaDistribution;
 import org.apache.commons.math3.linear.Array2DRowRealMatrix;
 import org.apache.commons.math3.linear.QRDecomposition;
@@ -10,10 +9,25 @@ import org.apache.commons.math3.linear.RealMatrix;
 import java.util.Arrays;
 import java.util.Random;
 
+/**
+ * Java implementation of the TurboVec quantization primitives.
+ *
+ * <p>The validation, codebook, packing, TQ+ calibration, and raw-query scoring
+ * semantics are aligned with turbovec-main. Packed bytes are not guaranteed to
+ * be binary-compatible with turbovec-main yet because Rust uses
+ * ChaCha8Rng + StandardNormal for its deterministic rotation matrix, while this
+ * Java implementation still uses java.util.Random with the same seed.</p>
+ */
 public class TurboVec {
+    public static final int MAX_DIM = 65_536;
+    private static final float MAX_INPUT_MAGNITUDE = 1e16f;
+    private static final int TQPLUS_MIN_SAMPLES = 1000;
+    private static final double TQPLUS_P_LO = 0.05;
+    private static final double TQPLUS_P_HI = 0.95;
+    private static final long ROTATION_SEED = 42L;
+
     private final int dim;
     private final int bitWidth;
-    private final int numLevels;
     private final float[] boundaries;
     private final float[] centroids;
     private final float[][] rotationMatrix; // [dim][dim]
@@ -21,29 +35,35 @@ public class TurboVec {
     private float[] shift;
     private float[] scaleTq;
     private float[] invScaleTq;
-
-    // Constants
-    private static final long ROTATION_SEED = 42L; // Same seed or configurable
+    private boolean hasQuantizedVectors;
 
     public TurboVec(int dim, int bitWidth) {
+        validateConstructorArgs(dim, bitWidth);
         this.dim = dim;
         this.bitWidth = bitWidth;
-        this.numLevels = 1 << bitWidth;
 
-        // 1. Setup Lloyd-Max Codebook
         float[][] codebook = generateLloydMaxCodebook(bitWidth, dim);
         this.boundaries = codebook[0];
         this.centroids = codebook[1];
-
-        // 2. Generate Random Orthogonal Rotation Matrix
         this.rotationMatrix = generateRotationMatrix(dim);
 
-        // Initialize default identity calibration
         this.shift = new float[dim];
         this.scaleTq = new float[dim];
         this.invScaleTq = new float[dim];
         Arrays.fill(this.scaleTq, 1.0f);
         Arrays.fill(this.invScaleTq, 1.0f);
+    }
+
+    private static void validateConstructorArgs(int dim, int bitWidth) {
+        if (bitWidth < 2 || bitWidth > 4) {
+            throw new IllegalArgumentException("bitWidth must be in {2, 3, 4}");
+        }
+        if (dim <= 0 || dim % 8 != 0) {
+            throw new IllegalArgumentException("dim must be positive and divisible by 8");
+        }
+        if (dim > MAX_DIM) {
+            throw new IllegalArgumentException("dim must be <= " + MAX_DIM);
+        }
     }
 
     private float[][] generateRotationMatrix(int dim) {
@@ -69,7 +89,7 @@ public class TurboVec {
         return result;
     }
 
-    private float[][] generateLloydMaxCodebook(int bits, int dim) {
+    static float[][] generateLloydMaxCodebook(int bits, int dim) {
         int maxIter = 200;
         double tol = 1e-12;
         int nLevels = 1 << bits;
@@ -83,8 +103,6 @@ public class TurboVec {
         for (int i = 0; i < nLevels; i++) {
             centroids[i] = -spread + 2.0 * spread * i / (nLevels - 1.0);
         }
-
-        SimpsonIntegrator integrator = new SimpsonIntegrator();
 
         for (int iter = 0; iter < maxIter; iter++) {
             double[] boundaries = new double[nLevels - 1];
@@ -113,7 +131,7 @@ public class TurboVec {
                         double t = (x + 1.0) / 2.0;
                         return x * beta.density(t) / 2.0;
                     };
-                    double mean = adaptiveSimpson(f, lo, hi, 1e-14, 50, integrator);
+                    double mean = adaptiveSimpson(f, lo, hi, 1e-14, 50);
                     newCentroids[i] = mean / prob;
                 }
             }
@@ -140,23 +158,60 @@ public class TurboVec {
         return new float[][]{floatBoundaries, floatCentroids};
     }
 
-    private double adaptiveSimpson(UnivariateFunction f, double a, double b, double tol, int maxDepth, SimpsonIntegrator integrator) {
-        try {
-            // Provide a fast fallback using commons-math simpson integrator
-            return integrator.integrate(10000, f, a, b);
-        } catch (Exception e) {
-            return 0.0;
+    private static double adaptiveSimpson(UnivariateFunction f, double a, double b, double tol, int maxDepth) {
+        double mid = (a + b) / 2.0;
+        double fa = f.value(a);
+        double fb = f.value(b);
+        double fm = f.value(mid);
+        double whole = (b - a) / 6.0 * (fa + 4.0 * fm + fb);
+        double result = adaptiveSimpsonRec(f, a, b, fa, fb, fm, whole, tol, maxDepth);
+        if (!Double.isFinite(result)) {
+            throw new IllegalStateException("Lloyd-Max codebook integration produced a non-finite result");
         }
+        return result;
+    }
+
+    private static double adaptiveSimpsonRec(
+            UnivariateFunction f,
+            double a,
+            double b,
+            double fa,
+            double fb,
+            double fm,
+            double whole,
+            double tol,
+            int depth
+    ) {
+        double mid = (a + b) / 2.0;
+        double m1 = (a + mid) / 2.0;
+        double m2 = (mid + b) / 2.0;
+        double fm1 = f.value(m1);
+        double fm2 = f.value(m2);
+        double left = (mid - a) / 6.0 * (fa + 4.0 * fm1 + fm);
+        double right = (b - mid) / 6.0 * (fm + 4.0 * fm2 + fb);
+        double refined = left + right;
+        if (depth == 0 || Math.abs(refined - whole) < 15.0 * tol) {
+            return refined + (refined - whole) / 15.0;
+        }
+        return adaptiveSimpsonRec(f, a, mid, fa, fm, fm1, left, tol / 2.0, depth - 1)
+                + adaptiveSimpsonRec(f, mid, b, fm, fb, fm2, right, tol / 2.0, depth - 1);
     }
 
     public float[] getCentroidArray() {
-        return centroids;
+        return Arrays.copyOf(centroids, centroids.length);
+    }
+
+    public float[] getBoundaryArray() {
+        return Arrays.copyOf(boundaries, boundaries.length);
     }
 
     public void fitCalibration(float[][] batch) {
+        if (hasQuantizedVectors) {
+            throw new IllegalStateException("calibration cannot be refit after vectors have been quantized");
+        }
+        validateBatch(batch);
         int n = batch.length;
-        if (n < 1000) {
-            System.err.println("Batch size too small for reliable calibration (n < 1000). Using identity calibration.");
+        if (n < TQPLUS_MIN_SAMPLES) {
             Arrays.fill(shift, 0.0f);
             Arrays.fill(scaleTq, 1.0f);
             Arrays.fill(invScaleTq, 1.0f);
@@ -182,14 +237,12 @@ public class TurboVec {
 
         double a = (dim - 1.0) / 2.0;
         BetaDistribution beta = new BetaDistribution(a, a);
-        double P_LO = 0.05;
-        double P_HI = 0.95;
-        float qcLo = (float) (2.0 * beta.inverseCumulativeProbability(P_LO) - 1.0);
-        float qcHi = (float) (2.0 * beta.inverseCumulativeProbability(P_HI) - 1.0);
+        float qcLo = (float) (2.0 * beta.inverseCumulativeProbability(TQPLUS_P_LO) - 1.0);
+        float qcHi = (float) (2.0 * beta.inverseCumulativeProbability(TQPLUS_P_HI) - 1.0);
         float qcSpan = qcHi - qcLo;
 
-        int loIdx = (int) (n * P_LO);
-        int hiIdx = Math.min((int) (n * P_HI), n - 1);
+        int loIdx = (int) (n * TQPLUS_P_LO);
+        int hiIdx = Math.min((int) (n * TQPLUS_P_HI), n - 1);
 
         for (int d = 0; d < dim; d++) {
             float[] coord = new float[n];
@@ -217,7 +270,62 @@ public class TurboVec {
         return (float) Math.sqrt(sum);
     }
 
+    private void validateBatch(float[][] batch) {
+        if (batch == null) {
+            throw new IllegalArgumentException("batch must not be null");
+        }
+        for (int i = 0; i < batch.length; i++) {
+            validateVector(batch[i], "batch[" + i + "]");
+        }
+    }
+
+    private void validateVector(float[] vec, String name) {
+        if (vec == null) {
+            throw new IllegalArgumentException(name + " must not be null");
+        }
+        if (vec.length != dim) {
+            throw new IllegalArgumentException(name + " length must equal dim " + dim);
+        }
+        for (int i = 0; i < vec.length; i++) {
+            float value = vec[i];
+            if (!Float.isFinite(value) || Math.abs(value) >= MAX_INPUT_MAGNITUDE) {
+                throw new IllegalArgumentException(name + "[" + i + "] must be finite and |value| < 1e16");
+            }
+        }
+    }
+
+    private void validatePackedCodes(byte[] packedCodes) {
+        if (packedCodes == null) {
+            throw new IllegalArgumentException("packedCodes must not be null");
+        }
+        int expectedLength = bitWidth * dim / 8;
+        if (packedCodes.length != expectedLength) {
+            throw new IllegalArgumentException("packedCodes length must be " + expectedLength);
+        }
+    }
+
+    private void validatePositions(int[] quantizedPos) {
+        if (quantizedPos == null) {
+            throw new IllegalArgumentException("quantizedPos must not be null");
+        }
+        if (quantizedPos.length != dim) {
+            throw new IllegalArgumentException("quantizedPos length must equal dim " + dim);
+        }
+        for (int i = 0; i < quantizedPos.length; i++) {
+            if (quantizedPos[i] < 0 || quantizedPos[i] >= centroids.length) {
+                throw new IllegalArgumentException("quantizedPos[" + i + "] is outside the codebook range");
+            }
+        }
+    }
+
+    private void validateNorm(float norm) {
+        if (!Float.isFinite(norm)) {
+            throw new IllegalArgumentException("norm must be finite");
+        }
+    }
+
     public int[] getCentroidPositions(float[] embedding) {
+        validateVector(embedding, "embedding");
         float norm = computeNorm(embedding);
         float[] unit = new float[dim];
         if (norm > 1e-10) {
@@ -242,6 +350,7 @@ public class TurboVec {
     }
 
     public QuantizedVector quantize(float[] embedding) {
+        validateVector(embedding, "embedding");
         float norm = computeNorm(embedding);
         float[] unit = new float[dim];
         if (norm > 1e-10) {
@@ -282,10 +391,12 @@ public class TurboVec {
         }
 
         float adjustedNorm = (float) (norm / Math.max(inner, 1e-10));
+        hasQuantizedVectors = true;
         return new QuantizedVector(packedRow, adjustedNorm);
     }
 
     public int[] unpack(byte[] packedCodes) {
+        validatePackedCodes(packedCodes);
         int bytesPerPlane = dim / 8;
         int[] positions = new int[dim];
         for (int j = 0; j < dim; j++) {
@@ -304,6 +415,8 @@ public class TurboVec {
     }
 
     public float[] convertToNormalSpace(int[] quantizedPos, float originalNorm) {
+        validatePositions(quantizedPos);
+        validateNorm(originalNorm);
         float[] rotOrig = new float[dim];
         for (int d = 0; d < dim; d++) {
             int code = quantizedPos[d];
@@ -327,10 +440,51 @@ public class TurboVec {
     }
 
     /**
+     * Pre-rotates a raw query vector into the quantized space to prepare it for 
+     * fast asymmetric distance calculation.
+     */
+    public float[] rotateQuery(float[] query) {
+        float norm = computeNorm(query);
+        float[] unit = new float[dim];
+        if (norm > 1e-10) {
+            for (int d = 0; d < dim; d++) unit[d] = query[d] / norm;
+        }
+
+        float[] rotated = new float[dim];
+        for (int d = 0; d < dim; d++) {
+            float sum = 0;
+            for (int j = 0; j < dim; j++) {
+                sum += unit[j] * rotationMatrix[d][j];
+            }
+            rotated[d] = sum * norm;
+        }
+        return rotated;
+    }
+
+    /**
+     * Computes the asymmetric dot product using a pre-rotated raw query and a quantized database vector.
+     * This avoids reconstructing the database vector, turning an O(dim^2) operation into O(dim).
+     */
+    public float asymmetricDotProduct(float[] preRotatedQuery, QuantizedVector dbVec) {
+        int[] posDb = unpack(dbVec.getPackedCodes());
+        float sum = 0;
+        for (int d = 0; d < dim; d++) {
+            float valDb = centroids[posDb[d]] * invScaleTq[d] - shift[d];
+            sum += preRotatedQuery[d] * valDb;
+        }
+        return sum * dbVec.getNorm();
+    }
+
+    /**
      * Computes the symmetric dot product directly in the rotated space.
+     * For search-style scoring, prefer
+     * {@link #scoreRawQuery(float[], QuantizedVector)}.
      * This avoids the O(dim^2) reconstruction matrix multiplication.
      */
     public float symmetricDotProduct(QuantizedVector q1, QuantizedVector q2) {
+        if (q1 == null || q2 == null) {
+            throw new IllegalArgumentException("quantized vectors must not be null");
+        }
         int[] pos1 = unpack(q1.getPackedCodes());
         int[] pos2 = unpack(q2.getPackedCodes());
         float sum = 0;
@@ -347,6 +501,11 @@ public class TurboVec {
      * Use this when scoring a single query against many database vectors.
      */
     public float symmetricDotProduct(float[] queryRotatedVals, float queryNorm, QuantizedVector dbVec) {
+        validateVector(queryRotatedVals, "queryRotatedVals");
+        validateNorm(queryNorm);
+        if (dbVec == null) {
+            throw new IllegalArgumentException("dbVec must not be null");
+        }
         int[] posDb = unpack(dbVec.getPackedCodes());
         float sum = 0;
         for (int d = 0; d < dim; d++) {
@@ -357,14 +516,48 @@ public class TurboVec {
     }
 
     /**
+     * Scores an unquantized query against a quantized database vector using the
+     * same TQ+ inverse-query calibration math as turbovec-main search.
+     */
+    public float scoreRawQuery(float[] query, QuantizedVector dbVec) {
+        validateVector(query, "query");
+        if (dbVec == null) {
+            throw new IllegalArgumentException("dbVec must not be null");
+        }
+        int[] posDb = unpack(dbVec.getPackedCodes());
+        float[] qRot = rotate(query);
+        double sum = 0.0;
+        for (int d = 0; d < dim; d++) {
+            double valDb = centroids[posDb[d]] * invScaleTq[d] - shift[d];
+            sum += qRot[d] * valDb;
+        }
+        return (float) (sum * dbVec.getNorm());
+    }
+
+    /**
      * Helper to get the rotated float values for a quantized vector directly.
      */
     public float[] getQuantizedRotatedValues(QuantizedVector q) {
+        if (q == null) {
+            throw new IllegalArgumentException("q must not be null");
+        }
         int[] pos = unpack(q.getPackedCodes());
         float[] vals = new float[dim];
         for (int d = 0; d < dim; d++) {
             vals[d] = centroids[pos[d]] * invScaleTq[d] - shift[d];
         }
         return vals;
+    }
+
+    private float[] rotate(float[] vector) {
+        float[] rotated = new float[dim];
+        for (int d = 0; d < dim; d++) {
+            float sum = 0;
+            for (int j = 0; j < dim; j++) {
+                sum += vector[j] * rotationMatrix[d][j];
+            }
+            rotated[d] = sum;
+        }
+        return rotated;
     }
 }

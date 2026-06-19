@@ -7,7 +7,7 @@ import java.util.Random;
 public class RecallBenchmark {
 
     public static void main(String[] args) {
-        int dim = 1536;
+        int dim = 384;
         int bits = 4;
         int numVectors = 50000;
         int numQueries = 1000;
@@ -66,14 +66,6 @@ public class RecallBenchmark {
         }
         System.out.println("Quantization took " + (System.currentTimeMillis() - start) + " ms");
 
-        System.out.println("Reconstructing database for scoring...");
-        start = System.currentTimeMillis();
-        float[][] approxDB = new float[numVectors][dim];
-        for (int i = 0; i < numVectors; i++) {
-            approxDB[i] = turbovec.convertToNormalSpace(quantizedDB[i].getPackedCodes(), quantizedDB[i].getNorm());
-        }
-        System.out.println("Reconstruction took " + (System.currentTimeMillis() - start) + " ms");
-
         System.out.println("Evaluating recall...");
         double totalRecall1 = 0;
         double totalRecall5 = 0;
@@ -83,6 +75,7 @@ public class RecallBenchmark {
         start = System.currentTimeMillis();
         for (int q = 0; q < numQueries; q++) {
             float[] query = queries[q];
+            float[] rotatedQuery = turbovec.rotateQuery(query);
 
             // Exact scores
             DocScore[] exactScores = new DocScore[numVectors];
@@ -91,10 +84,10 @@ public class RecallBenchmark {
             }
             Arrays.sort(exactScores, Comparator.comparingDouble((DocScore s) -> s.score).reversed());
             
-            // Approx scores
+            // Approx scores using pre-rotated query (ADC)
             DocScore[] approxScores = new DocScore[numVectors];
             for (int i = 0; i < numVectors; i++) {
-                approxScores[i] = new DocScore(i, dotProduct(query, approxDB[i]));
+                approxScores[i] = new DocScore(i, turbovec.scoreRawQuery(query, quantizedDB[i]));
             }
             Arrays.sort(approxScores, Comparator.comparingDouble((DocScore s) -> s.score).reversed());
 
