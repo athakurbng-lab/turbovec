@@ -75,11 +75,10 @@ public class RecallBenchmark {
         System.out.println("Reconstruction took " + (System.currentTimeMillis() - start) + " ms");
 
         System.out.println("Evaluating recall...");
-        int recallAt1 = 0;
-        int recallAt5 = 0;
-        int recallAt10 = 0;
-        int recallAt15 = 0;
-        double totalOverlap = 0;
+        double totalRecall1 = 0;
+        double totalRecall5 = 0;
+        double totalRecall10 = 0;
+        double totalRecall15 = 0;
 
         start = System.currentTimeMillis();
         for (int q = 0; q < numQueries; q++) {
@@ -92,12 +91,6 @@ public class RecallBenchmark {
             }
             Arrays.sort(exactScores, Comparator.comparingDouble((DocScore s) -> s.score).reversed());
             
-            int trueNN = exactScores[0].id;
-            int[] trueTopK = new int[topK];
-            for (int k = 0; k < topK; k++) {
-                trueTopK[k] = exactScores[k].id;
-            }
-
             // Approx scores
             DocScore[] approxScores = new DocScore[numVectors];
             for (int i = 0; i < numVectors; i++) {
@@ -105,42 +98,38 @@ public class RecallBenchmark {
             }
             Arrays.sort(approxScores, Comparator.comparingDouble((DocScore s) -> s.score).reversed());
 
-            // Check if true NN is in top-K
-            boolean foundIn1 = false;
-            boolean foundIn5 = false;
-            boolean foundIn10 = false;
-            boolean foundIn15 = false;
-            int overlap = 0;
+            // Check intersection overlap at different K values
+            int overlap1 = computeIntersectionSize(exactScores, approxScores, 1);
+            int overlap5 = computeIntersectionSize(exactScores, approxScores, 5);
+            int overlap10 = computeIntersectionSize(exactScores, approxScores, 10);
+            int overlap15 = computeIntersectionSize(exactScores, approxScores, 15);
 
-            for (int k = 0; k < topK; k++) {
-                int approxId = approxScores[k].id;
-                if (k == 0 && approxId == trueNN) foundIn1 = true;
-                if (k < 5 && approxId == trueNN) foundIn5 = true;
-                if (k < 10 && approxId == trueNN) foundIn10 = true;
-                if (k < 15 && approxId == trueNN) foundIn15 = true;
-
-                for (int j = 0; j < topK; j++) {
-                    if (approxId == trueTopK[j]) {
-                        overlap++;
-                        break;
-                    }
-                }
-            }
-
-            if (foundIn1) recallAt1++;
-            if (foundIn5) recallAt5++;
-            if (foundIn10) recallAt10++;
-            if (foundIn15) recallAt15++;
-            totalOverlap += overlap;
+            totalRecall1 += (double) overlap1 / 1.0;
+            totalRecall5 += (double) overlap5 / 5.0;
+            totalRecall10 += (double) overlap10 / 10.0;
+            totalRecall15 += (double) overlap15 / 15.0;
         }
         System.out.println("Evaluation took " + (System.currentTimeMillis() - start) + " ms");
 
         System.out.printf("Results over %d queries (Dim=%d, Bits=%d, N=%d):\n", numQueries, dim, bits, numVectors);
-        System.out.printf("Recall@1:  %.2f%%\n", 100.0 * recallAt1 / numQueries);
-        System.out.printf("Recall@5:  %.2f%%\n", 100.0 * recallAt5 / numQueries);
-        System.out.printf("Recall@10: %.2f%%\n", 100.0 * recallAt10 / numQueries);
-        System.out.printf("Recall@15: %.2f%%\n", 100.0 * recallAt15 / numQueries);
-        System.out.printf("Overlap@15: %.2f%%\n", 100.0 * totalOverlap / (numQueries * topK));
+        System.out.printf("Recall@1:  %.2f%%\n", 100.0 * totalRecall1 / numQueries);
+        System.out.printf("Recall@5:  %.2f%%\n", 100.0 * totalRecall5 / numQueries);
+        System.out.printf("Recall@10: %.2f%%\n", 100.0 * totalRecall10 / numQueries);
+        System.out.printf("Recall@15: %.2f%%\n", 100.0 * totalRecall15 / numQueries);
+    }
+
+    private static int computeIntersectionSize(DocScore[] exactScores, DocScore[] approxScores, int k) {
+        int overlap = 0;
+        for (int i = 0; i < k; i++) {
+            int approxId = approxScores[i].id;
+            for (int j = 0; j < k; j++) {
+                if (approxId == exactScores[j].id) {
+                    overlap++;
+                    break;
+                }
+            }
+        }
+        return overlap;
     }
 
     private static float[] randomUnitVector(int dim, Random rand) {
