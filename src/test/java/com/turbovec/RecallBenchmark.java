@@ -7,7 +7,7 @@ import java.util.Random;
 public class RecallBenchmark {
 
     public static void main(String[] args) {
-        int dim = 384;
+        int dim = 1536;
         int bits = 4;
         int numVectors = 50000;
         int numQueries = 1000;

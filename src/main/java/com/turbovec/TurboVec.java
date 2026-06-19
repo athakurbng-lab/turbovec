@@ -325,4 +325,46 @@ public class TurboVec {
         int[] positions = unpack(packedCodes);
         return convertToNormalSpace(positions, norm);
     }
+
+    /**
+     * Computes the symmetric dot product directly in the rotated space.
+     * This avoids the O(dim^2) reconstruction matrix multiplication.
+     */
+    public float symmetricDotProduct(QuantizedVector q1, QuantizedVector q2) {
+        int[] pos1 = unpack(q1.getPackedCodes());
+        int[] pos2 = unpack(q2.getPackedCodes());
+        float sum = 0;
+        for (int d = 0; d < dim; d++) {
+            float val1 = centroids[pos1[d]] * invScaleTq[d] - shift[d];
+            float val2 = centroids[pos2[d]] * invScaleTq[d] - shift[d];
+            sum += val1 * val2;
+        }
+        return sum * q1.getNorm() * q2.getNorm();
+    }
+
+    /**
+     * Optimized symmetric dot product where the query is pre-unpacked into floating point rotated values.
+     * Use this when scoring a single query against many database vectors.
+     */
+    public float symmetricDotProduct(float[] queryRotatedVals, float queryNorm, QuantizedVector dbVec) {
+        int[] posDb = unpack(dbVec.getPackedCodes());
+        float sum = 0;
+        for (int d = 0; d < dim; d++) {
+            float valDb = centroids[posDb[d]] * invScaleTq[d] - shift[d];
+            sum += queryRotatedVals[d] * valDb;
+        }
+        return sum * queryNorm * dbVec.getNorm();
+    }
+
+    /**
+     * Helper to get the rotated float values for a quantized vector directly.
+     */
+    public float[] getQuantizedRotatedValues(QuantizedVector q) {
+        int[] pos = unpack(q.getPackedCodes());
+        float[] vals = new float[dim];
+        for (int d = 0; d < dim; d++) {
+            vals[d] = centroids[pos[d]] * invScaleTq[d] - shift[d];
+        }
+        return vals;
+    }
 }
