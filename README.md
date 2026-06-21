@@ -1,43 +1,69 @@
 # turbovec-java
 
-A complete, dependency-free (except for `commons-math3` for Beta distribution and QR decomposition) Java wrapper for the TurboQuant algorithm logic from [turbovec](https://github.com/RyanCodrai/turbovec).
+A complete, high-performance Java implementation of the TurboQuant algorithm logic originally developed in [turbovec](https://github.com/RyanCodrai/turbovec).
 
 ## Features
 
-- **Quantization:** Converts float embeddings into quantized codes using a deterministic random orthogonal rotation matrix, Beta distribution Lloyd-Max codebooks, and TQ+ calibration.
-- **Reconstruction:** Converts quantized bit-packed codes back to approximated vectors in normal space.
-- **Similarity Search Evaluation:** Includes a recall benchmark out-of-the-box (`RecallBenchmark.java`).
+- **Blazing Fast ADC Scoring:** Implements Asymmetric Dot Product (ADC) using precomputed Lookup Tables (LUTs) and zero-allocation unpacking to score millions of vectors per second without heavy float multiplications.
+- **Quantization:** Converts float embeddings into highly compressed codes (4, 8, or 16 bits) using random orthogonal rotations and Beta-distribution Lloyd-Max codebooks.
+- **TQ+ Calibration:** Mathematically aligns vector margins by shifting and scaling empirically observed quantiles onto standard distributions.
+- **Automated Experimentation:** A dedicated benchmark suite that analyzes the recall tradeoff across bit-widths, codebooks, calibration sizes, and rotation strategies.
 
 ## Usage
 
 ```java
-int dim = 1536; // OpenAI dim
-int bitWidth = 4; // 4-bit precision
-TurboVec turbovec = new TurboVec(dim, bitWidth);
+int dim = 384; 
+int bitWidth = 8;
+long seed = 100L;
+boolean fillRowFirst = false;
 
-// Fit TQ+ Calibration (optional but highly recommended for accuracy)
-// turbovec.fitCalibration(batchOfEmbeddings);
+TurboVec turbovec = new TurboVec(dim, bitWidth, seed, fillRowFirst);
 
-// Quantize to bit-packed array
+// Fit TQ+ Calibration on a sample of your database (Mandatory for high accuracy)
+turbovec.fitCalibration(databaseSample);
+
+// Quantize vectors to bit-packed byte arrays
 QuantizedVector qVec = turbovec.quantize(embedding);
 
-// Reconstruct
-float[] normalSpaceVec = turbovec.convertToNormalSpace(qVec.getPackedCodes(), qVec.getNorm());
+// --- Fast Asymmetric Search (ADC) ---
+// 1. Rotate the high-precision query once
+float[] rotatedQuery = turbovec.rotateQuery(query);
+
+// 2. Precompute a Lookup Table (LUT) for instant scoring
+float[][] lut = turbovec.precomputeAsymmetricLUT(rotatedQuery);
+
+// 3. Score against the database instantly using the LUT
+int[] unpackedDB = turbovec.unpack(qVec.getPackedCodes());
+float score = turbovec.asymmetricDotProductLUT(lut, unpackedDB);
 ```
 
-## Running Benchmarks
+## Running the Automated Benchmark
 
+The project includes `ExperimentBenchmark.java`, which automates testing and outputs a formatted table comparing the exact intersection (Recall) of the highest-performing configurations across 4-bit, 8-bit, and 16-bit architectures.
+
+### Step 1: Prepare Your Data (Optional)
+To test against real data, drop two text files into the project root:
+- `database.txt`
+- `queries.txt`
+
+**Format requirements:**
+- One vector per line.
+- Values must be floats separated by spaces or commas (e.g., `0.012, -0.34, 0.99...`).
+- The benchmark expects the files to match the hardcoded `dim=384` dimension size (update the variable inside `ExperimentBenchmark.java` if using a different dimension).
+- *Fallback:* If these files are not found, the benchmark gracefully defaults to generating 50,000 random unit vectors for the database and 1,000 queries.
+
+### Step 2: Execute the Script
+Run the following Maven command from your terminal:
 ```bash
-mvn test-compile exec:java -Dexec.classpathScope="test" -Dexec.mainClass="com.turbovec.RecallBenchmark"
+mvn test-compile exec:java -Dexec.classpathScope="test" -Dexec.mainClass="com.turbovec.ExperimentBenchmark"
 ```
 
-By default, the benchmark generates random 384-dimensional unit vectors. 
-If you want to use your own dataset, you can provide paths to space-separated `.txt` files containing your embeddings (where each line is a vector and each space-separated value is a dimension).
+### Step 3: Understanding the Report
+The benchmark normalizes all loaded vectors to unit magnitude, calculates the **exact** ground truth by performing full precision dot-products, and then executes the quantized evaluation.
 
-Simply edit `src/test/java/com/turbovec/RecallBenchmark.java` and change the following variables at the top of the `main` method:
+The final report evaluates three specific optimized configurations:
+1. **4-bit** (`25%` calibration size, `seed=0`, `rowFirst=true`) - The highest optimized setup for 4-bit Asymmetric Search.
+2. **8-bit** (`50%` calibration size, `seed=100`, `rowFirst=false`) - Pushes recall higher while maintaining memory efficiency via 8-bit quantization.
+3. **16-bit** (`10%` calibration size, `seed=0`, `rowFirst=false`) - Extreme precision configuration using a 65,536-level codebook.
 
-```java
-String queryFile = "path/to/your/queries.txt"; // Link to query file
-String dataFile = "path/to/your/database.txt";  // Link to data file
-```
-If these variables are left empty (`""`), the benchmark will default back to generating random data.
+The script evaluates the results against the exact ground truth to report **Recall@5**, **Recall@10**, and **Recall@15** (calculated via exact array intersection).

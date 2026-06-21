@@ -24,7 +24,6 @@ public class TurboVec {
     private static final int TQPLUS_MIN_SAMPLES = 1000;
     private static final double TQPLUS_P_LO = 0.05;
     private static final double TQPLUS_P_HI = 0.95;
-    private static final long ROTATION_SEED = 42L;
 
     private final int dim;
     private final int bitWidth;
@@ -38,6 +37,10 @@ public class TurboVec {
     private boolean hasQuantizedVectors;
 
     public TurboVec(int dim, int bitWidth) {
+        this(dim, bitWidth, 42L, false);
+    }
+
+    public TurboVec(int dim, int bitWidth, long seed, boolean fillRowFirst) {
         validateConstructorArgs(dim, bitWidth);
         this.dim = dim;
         this.bitWidth = bitWidth;
@@ -45,7 +48,7 @@ public class TurboVec {
         float[][] codebook = generateLloydMaxCodebook(bitWidth, dim);
         this.boundaries = codebook[0];
         this.centroids = codebook[1];
-        this.rotationMatrix = generateRotationMatrix(dim);
+        this.rotationMatrix = generateRotationMatrix(dim, seed, fillRowFirst);
 
         this.shift = new float[dim];
         this.scaleTq = new float[dim];
@@ -55,8 +58,8 @@ public class TurboVec {
     }
 
     private static void validateConstructorArgs(int dim, int bitWidth) {
-        if (bitWidth < 2 || bitWidth > 4) {
-            throw new IllegalArgumentException("bitWidth must be in {2, 3, 4}");
+        if (bitWidth < 2 || bitWidth > 16) {
+            throw new IllegalArgumentException("bitWidth must be between 2 and 16");
         }
         if (dim <= 0 || dim % 8 != 0) {
             throw new IllegalArgumentException("dim must be positive and divisible by 8");
@@ -66,12 +69,24 @@ public class TurboVec {
         }
     }
 
-    private float[][] generateRotationMatrix(int dim) {
-        Random rng = new Random(ROTATION_SEED);
+    public int getDim() {
+        return dim;
+    }
+
+    private float[][] generateRotationMatrix(int dim, long seed, boolean fillRowFirst) {
+        Random rng = new Random(seed);
         double[][] gData = new double[dim][dim];
-        for (int j = 0; j < dim; j++) {
+        if (fillRowFirst) {
             for (int i = 0; i < dim; i++) {
-                gData[i][j] = rng.nextGaussian();
+                for (int j = 0; j < dim; j++) {
+                    gData[i][j] = rng.nextGaussian();
+                }
+            }
+        } else {
+            for (int j = 0; j < dim; j++) {
+                for (int i = 0; i < dim; i++) {
+                    gData[i][j] = rng.nextGaussian();
+                }
             }
         }
         RealMatrix g = new Array2DRowRealMatrix(gData);
@@ -390,33 +405,33 @@ public class TurboVec {
             }
         }
 
-        float adjustedNorm = (float) (norm / Math.max(inner, 1e-10));
         hasQuantizedVectors = true;
-        return new QuantizedVector(packedRow, adjustedNorm);
+        return new QuantizedVector(packedRow);
     }
 
-    public int[] unpack(byte[] packedCodes) {
-        validatePackedCodes(packedCodes);
+    public void unpack(byte[] packedRow, int[] outCodes) {
         int bytesPerPlane = dim / 8;
-        int[] positions = new int[dim];
         for (int j = 0; j < dim; j++) {
-            int code = 0;
             int bytePos = j / 8;
             int bitPos = 7 - (j % 8);
+            int code = 0;
             for (int p = 0; p < bitWidth; p++) {
-                byte b = packedCodes[p * bytesPerPlane + bytePos];
-                if ((b & (1 << bitPos)) != 0) {
+                if ((packedRow[p * bytesPerPlane + bytePos] & (1 << bitPos)) != 0) {
                     code |= (1 << p);
                 }
             }
-            positions[j] = code;
+            outCodes[j] = code;
         }
-        return positions;
     }
 
-    public float[] convertToNormalSpace(int[] quantizedPos, float originalNorm) {
+    public int[] unpack(byte[] packedRow) {
+        int[] codes = new int[dim];
+        unpack(packedRow, codes);
+        return codes;
+    }
+
+    public float[] convertToNormalSpace(int[] quantizedPos) {
         validatePositions(quantizedPos);
-        validateNorm(originalNorm);
         float[] rotOrig = new float[dim];
         for (int d = 0; d < dim; d++) {
             int code = quantizedPos[d];
@@ -429,14 +444,14 @@ public class TurboVec {
             for (int j = 0; j < dim; j++) {
                 sum += rotOrig[j] * rotationMatrix[j][i];
             }
-            result[i] = sum * originalNorm;
+            result[i] = sum;
         }
         return result;
     }
 
-    public float[] convertToNormalSpace(byte[] packedCodes, float norm) {
+    public float[] convertToNormalSpace(byte[] packedCodes) {
         int[] positions = unpack(packedCodes);
-        return convertToNormalSpace(positions, norm);
+        return convertToNormalSpace(positions);
     }
 
     /**
@@ -461,10 +476,29 @@ public class TurboVec {
         return rotated;
     }
 
-    /**
-     * Computes the asymmetric dot product using a pre-rotated raw query and a quantized database vector.
-     * This avoids reconstructing the database vector, turning an O(dim^2) operation into O(dim).
-     */
+    public float[][] precomputeAsymmetricLUT(float[] preRotatedQuery) {
+        int numCentroids = 1 << bitWidth;
+        float[][] lut = new float[dim][numCentroids];
+        for (int d = 0; d < dim; d++) {
+            float q = preRotatedQuery[d];
+            float invS = invScaleTq[d];
+            float sh = shift[d];
+            for (int c = 0; c < numCentroids; c++) {
+                float valDb = centroids[c] * invS - sh;
+                lut[d][c] = q * valDb;
+            }
+        }
+        return lut;
+    }
+
+    public float asymmetricDotProductLUT(float[][] lut, int[] unpackedDb) {
+        float sum = 0;
+        for (int d = 0; d < dim; d++) {
+            sum += lut[d][unpackedDb[d]];
+        }
+        return sum;
+    }
+
     public float asymmetricDotProduct(float[] preRotatedQuery, QuantizedVector dbVec) {
         int[] posDb = unpack(dbVec.getPackedCodes());
         float sum = 0;
@@ -472,7 +506,7 @@ public class TurboVec {
             float valDb = centroids[posDb[d]] * invScaleTq[d] - shift[d];
             sum += preRotatedQuery[d] * valDb;
         }
-        return sum * dbVec.getNorm();
+        return sum;
     }
 
     /**
@@ -493,16 +527,15 @@ public class TurboVec {
             float val2 = centroids[pos2[d]] * invScaleTq[d] - shift[d];
             sum += val1 * val2;
         }
-        return sum * q1.getNorm() * q2.getNorm();
+        return sum;
     }
 
     /**
      * Optimized symmetric dot product where the query is pre-unpacked into floating point rotated values.
      * Use this when scoring a single query against many database vectors.
      */
-    public float symmetricDotProduct(float[] queryRotatedVals, float queryNorm, QuantizedVector dbVec) {
+    public float symmetricDotProduct(float[] queryRotatedVals, QuantizedVector dbVec) {
         validateVector(queryRotatedVals, "queryRotatedVals");
-        validateNorm(queryNorm);
         if (dbVec == null) {
             throw new IllegalArgumentException("dbVec must not be null");
         }
@@ -512,7 +545,7 @@ public class TurboVec {
             float valDb = centroids[posDb[d]] * invScaleTq[d] - shift[d];
             sum += queryRotatedVals[d] * valDb;
         }
-        return sum * queryNorm * dbVec.getNorm();
+        return sum;
     }
 
     /**
@@ -531,7 +564,7 @@ public class TurboVec {
             double valDb = centroids[posDb[d]] * invScaleTq[d] - shift[d];
             sum += qRot[d] * valDb;
         }
-        return (float) (sum * dbVec.getNorm());
+        return (float) sum;
     }
 
     /**

@@ -87,7 +87,7 @@ public class RecallBenchmark {
             // Approx scores using pre-rotated query (ADC)
             DocScore[] approxScores = new DocScore[numVectors];
             for (int i = 0; i < numVectors; i++) {
-                approxScores[i] = new DocScore(i, turbovec.scoreRawQuery(query, quantizedDB[i]));
+                approxScores[i] = new DocScore(i, turbovec.asymmetricDotProduct(rotatedQuery, quantizedDB[i]));
             }
             Arrays.sort(approxScores, Comparator.comparingDouble((DocScore s) -> s.score).reversed());
 
@@ -145,8 +145,17 @@ public class RecallBenchmark {
             float[][] vectors = new float[lines.size()][expectedDim];
             for (int i = 0; i < lines.size(); i++) {
                 String[] parts = lines.get(i).trim().split("\\s+");
+                float norm = 0;
                 for (int j = 0; j < expectedDim; j++) {
-                    vectors[i][j] = Float.parseFloat(parts[j]);
+                    float val = Float.parseFloat(parts[j]);
+                    vectors[i][j] = val;
+                    norm += val * val;
+                }
+                norm = (float) Math.sqrt(norm);
+                if (norm > 1e-10) {
+                    for (int j = 0; j < expectedDim; j++) {
+                        vectors[i][j] /= norm;
+                    }
                 }
             }
             return vectors;

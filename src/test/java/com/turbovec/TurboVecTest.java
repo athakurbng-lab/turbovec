@@ -12,7 +12,7 @@ public class TurboVecTest {
     @Test
     public void constructorRejectsUnsupportedParameters() {
         assertThrows(IllegalArgumentException.class, () -> new TurboVec(8, 1));
-        assertThrows(IllegalArgumentException.class, () -> new TurboVec(8, 5));
+        assertThrows(IllegalArgumentException.class, () -> new TurboVec(8, 17));
         assertThrows(IllegalArgumentException.class, () -> new TurboVec(0, 4));
         assertThrows(IllegalArgumentException.class, () -> new TurboVec(10, 4));
         assertThrows(IllegalArgumentException.class, () -> new TurboVec(TurboVec.MAX_DIM + 8, 4));
@@ -21,7 +21,7 @@ public class TurboVecTest {
     @Test
     public void quantizedVectorDefensivelyCopiesPackedCodes() {
         byte[] packed = new byte[]{1, 2, 3};
-        QuantizedVector vector = new QuantizedVector(packed, 1.0f);
+        QuantizedVector vector = new QuantizedVector(packed);
 
         packed[0] = 99;
         assertEquals(1, vector.getPackedCodes()[0]);
@@ -47,11 +47,11 @@ public class TurboVecTest {
 
         float[] huge = new float[8];
         huge[2] = 1e16f;
-        assertThrows(IllegalArgumentException.class, () -> turboVec.scoreRawQuery(huge, new QuantizedVector(new byte[2], 1.0f)));
+        assertThrows(IllegalArgumentException.class, () -> turboVec.scoreRawQuery(huge, new QuantizedVector(new byte[2])));
 
         assertThrows(IllegalArgumentException.class, () -> turboVec.unpack(new byte[1]));
-        assertThrows(IllegalArgumentException.class, () -> turboVec.convertToNormalSpace(new int[]{0, 1}, 1.0f));
-        assertThrows(IllegalArgumentException.class, () -> turboVec.convertToNormalSpace(new int[8], Float.NaN));
+        assertThrows(IllegalArgumentException.class, () -> turboVec.convertToNormalSpace(new int[]{0, 1}));
+        assertThrows(IllegalArgumentException.class, () -> turboVec.convertToNormalSpace(new int[8]));
     }
 
     @Test
@@ -95,7 +95,7 @@ public class TurboVecTest {
             assertEquals(64 / 8 * bits, quantized.getPackedCodes().length);
             assertEquals(64, turboVec.unpack(quantized.getPackedCodes()).length);
 
-            float[] reconstructed = turboVec.convertToNormalSpace(quantized.getPackedCodes(), quantized.getNorm());
+            float[] reconstructed = turboVec.convertToNormalSpace(quantized.getPackedCodes());
             assertEquals(64, reconstructed.length);
             for (float value : reconstructed) {
                 assertTrue(Float.isFinite(value));
@@ -107,9 +107,8 @@ public class TurboVecTest {
     public void zeroVectorReconstructsToZero() {
         TurboVec turboVec = new TurboVec(64, 4);
         QuantizedVector quantized = turboVec.quantize(new float[64]);
-        assertEquals(0.0f, quantized.getNorm(), 0.0f);
 
-        float[] reconstructed = turboVec.convertToNormalSpace(quantized.getPackedCodes(), quantized.getNorm());
+        float[] reconstructed = turboVec.convertToNormalSpace(quantized.getPackedCodes());
         for (float value : reconstructed) {
             assertEquals(0.0f, value, 0.0f);
         }
@@ -123,7 +122,7 @@ public class TurboVecTest {
 
         QuantizedVector quantized = turboVec.quantize(databaseVector);
         float score = turboVec.scoreRawQuery(query, quantized);
-        float[] reconstructed = turboVec.convertToNormalSpace(quantized.getPackedCodes(), quantized.getNorm());
+        float[] reconstructed = turboVec.convertToNormalSpace(quantized.getPackedCodes());
 
         assertEquals(dot(query, reconstructed), score, 1e-4f);
     }
