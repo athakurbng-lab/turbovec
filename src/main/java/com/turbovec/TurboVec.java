@@ -8,6 +8,7 @@ import org.apache.commons.math3.linear.RealMatrix;
 
 import java.util.Arrays;
 import java.util.Random;
+import java.util.stream.IntStream;
 
 /**
  * Java implementation of the TurboVec quantization primitives.
@@ -222,61 +223,42 @@ public class TurboVec {
 
     public void fitCalibration(float[][] batch) {
         if (hasQuantizedVectors) {
-            throw new IllegalStateException("calibration cannot be refit after vectors have been quantized");
+            throw new IllegalStateException("Cannot run calibration after vectors have been quantized");
         }
-        validateBatch(batch);
-        int n = batch.length;
-        if (n < TQPLUS_MIN_SAMPLES) {
-            Arrays.fill(shift, 0.0f);
-            Arrays.fill(scaleTq, 1.0f);
-            Arrays.fill(invScaleTq, 1.0f);
-            return;
+        if (batch == null || batch.length < TQPLUS_MIN_SAMPLES || batch[0].length != dim) {
+            throw new IllegalArgumentException("Batch must have at least " + TQPLUS_MIN_SAMPLES + " vectors of dimension " + dim);
         }
 
-        float[][] rotatedBatch = new float[n][dim];
-        for (int i = 0; i < n; i++) {
-            float[] vec = batch[i];
-            float norm = computeNorm(vec);
-            float[] unit = new float[dim];
-            if (norm > 1e-10) {
-                for (int d = 0; d < dim; d++) unit[d] = vec[d] / norm;
+        int batchSize = batch.length;
+        float[][] rotated = new float[batchSize][dim];
+        IntStream.range(0, batchSize).parallel().forEach(i -> {
+            rotated[i] = rotateQuery(batch[i]);
+        });
+
+        BetaDistribution beta = new BetaDistribution((dim - 1) / 2.0, (dim - 1) / 2.0);
+        double targetQ5 = 2.0 * beta.inverseCumulativeProbability(TQPLUS_P_LO) - 1.0;
+        double targetQ95 = 2.0 * beta.inverseCumulativeProbability(TQPLUS_P_HI) - 1.0;
+
+        int idx5 = (int) Math.round(batchSize * TQPLUS_P_LO);
+        int idx95 = (int) Math.round(batchSize * TQPLUS_P_HI);
+
+        IntStream.range(0, dim).parallel().forEach(d -> {
+            double[] vals = new double[batchSize];
+            for (int i = 0; i < batchSize; i++) {
+                vals[i] = rotated[i][d];
             }
-            for (int d = 0; d < dim; d++) {
-                float sum = 0;
-                for (int j = 0; j < dim; j++) {
-                    sum += unit[j] * rotationMatrix[d][j];
-                }
-                rotatedBatch[i][d] = sum;
-            }
-        }
+            Arrays.sort(vals);
 
-        double a = (dim - 1.0) / 2.0;
-        BetaDistribution beta = new BetaDistribution(a, a);
-        float qcLo = (float) (2.0 * beta.inverseCumulativeProbability(TQPLUS_P_LO) - 1.0);
-        float qcHi = (float) (2.0 * beta.inverseCumulativeProbability(TQPLUS_P_HI) - 1.0);
-        float qcSpan = qcHi - qcLo;
+            double q5 = vals[idx5];
+            double q95 = vals[idx95];
 
-        int loIdx = (int) (n * TQPLUS_P_LO);
-        int hiIdx = Math.min((int) (n * TQPLUS_P_HI), n - 1);
+            double scaleDb = (targetQ95 - targetQ5) / (q95 - q5);
+            double shiftDb = (targetQ5 / scaleDb) - q5;
 
-        for (int d = 0; d < dim; d++) {
-            float[] coord = new float[n];
-            for (int i = 0; i < n; i++) coord[i] = rotatedBatch[i][d];
-            Arrays.sort(coord);
-            float qeLo = coord[loIdx];
-            float qeHi = coord[hiIdx];
-            float qeSpan = qeHi - qeLo;
-
-            if (qeSpan > 1e-6f) {
-                scaleTq[d] = qcSpan / qeSpan;
-                shift[d] = qcLo / scaleTq[d] - qeLo;
-                invScaleTq[d] = 1.0f / scaleTq[d];
-            } else {
-                shift[d] = 0.0f;
-                scaleTq[d] = 1.0f;
-                invScaleTq[d] = 1.0f;
-            }
-        }
+            shift[d] = (float) shiftDb;
+            scaleTq[d] = (float) scaleDb;
+            invScaleTq[d] = 1.0f / scaleTq[d];
+        });
     }
 
     private float computeNorm(float[] vec) {
@@ -364,6 +346,12 @@ public class TurboVec {
         return positions;
     }
 
+    public QuantizedVector[] quantizeBatch(float[][] batch) {
+        return Arrays.stream(batch).parallel()
+                .map(this::quantize)
+                .toArray(QuantizedVector[]::new);
+    }
+
     public QuantizedVector quantize(float[] embedding) {
         validateVector(embedding, "embedding");
         float norm = computeNorm(embedding);
@@ -385,7 +373,9 @@ public class TurboVec {
 
         int bytesPerPlane = dim / 8;
         byte[] packedRow = new byte[bitWidth * bytesPerPlane];
+        byte[] qjlBits = new byte[bytesPerPlane];
         double inner = 0.0;
+        double sumAbsRes = 0.0;
 
         for (int j = 0; j < dim; j++) {
             int code = 0;
@@ -395,9 +385,16 @@ public class TurboVec {
 
             double centroidInOrig = centroids[code] * invScaleTq[j] - shift[j];
             inner += rotOrig[j] * centroidInOrig;
+            
+            double residual = rotOrig[j] - centroidInOrig;
+            sumAbsRes += Math.abs(residual);
 
             int bytePos = j / 8;
             int bitPos = 7 - (j % 8);
+            if (residual > 0) {
+                qjlBits[bytePos] |= (byte) (1 << bitPos);
+            }
+
             for (int p = 0; p < bitWidth; p++) {
                 if ((code & (1 << p)) != 0) {
                     packedRow[p * bytesPerPlane + bytePos] |= (byte) (1 << bitPos);
@@ -405,8 +402,9 @@ public class TurboVec {
             }
         }
 
+        float qjlScale = (float) (sumAbsRes / dim);
         hasQuantizedVectors = true;
-        return new QuantizedVector(packedRow);
+        return new QuantizedVector(packedRow, qjlBits, qjlScale);
     }
 
     public void unpack(byte[] packedRow, int[] outCodes) {
@@ -492,10 +490,32 @@ public class TurboVec {
     }
 
     public float asymmetricDotProductLUT(float[][] lut, int[] unpackedDb) {
+        return asymmetricDotProductLUTWithQJL(lut, unpackedDb, null, 0f, null);
+    }
+
+    public float asymmetricDotProductLUTWithQJL(float[][] lut, int[] unpackedDb, byte[] qjlBits, float qjlScale, float[] preRotatedQuery) {
         float sum = 0;
         for (int d = 0; d < dim; d++) {
             sum += lut[d][unpackedDb[d]];
         }
+        
+        if (qjlBits != null && preRotatedQuery != null) {
+            float qjlDot = 0;
+            int bytesPerPlane = dim / 8;
+            for (int i = 0; i < bytesPerPlane; i++) {
+                byte b = qjlBits[i];
+                for (int bit = 0; bit < 8; bit++) {
+                    int d = i * 8 + bit;
+                    if ((b & (1 << (7 - bit))) != 0) {
+                        qjlDot += preRotatedQuery[d];
+                    } else {
+                        qjlDot -= preRotatedQuery[d];
+                    }
+                }
+            }
+            sum += qjlScale * qjlDot;
+        }
+
         return sum;
     }
 
@@ -506,6 +526,25 @@ public class TurboVec {
             float valDb = centroids[posDb[d]] * invScaleTq[d] - shift[d];
             sum += preRotatedQuery[d] * valDb;
         }
+        
+        byte[] qjlBits = dbVec.getQjlBits();
+        if (qjlBits != null) {
+            float qjlDot = 0;
+            int bytesPerPlane = dim / 8;
+            for (int i = 0; i < bytesPerPlane; i++) {
+                byte b = qjlBits[i];
+                for (int bit = 0; bit < 8; bit++) {
+                    int d = i * 8 + bit;
+                    if ((b & (1 << (7 - bit))) != 0) {
+                        qjlDot += preRotatedQuery[d];
+                    } else {
+                        qjlDot -= preRotatedQuery[d];
+                    }
+                }
+            }
+            sum += dbVec.getQjlScale() * qjlDot;
+        }
+
         return sum;
     }
 
